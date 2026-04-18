@@ -82,4 +82,6 @@ class SafeDiv(FourCal):
         
 c = SafeDiv(4,0)
 print(c.div())
+#상속한 클래스의 메서드 중 일부를 수정해서 사용하는 것?
+
 
