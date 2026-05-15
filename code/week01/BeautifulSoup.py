@@ -11,6 +11,3 @@ if response.status_code == 200:
     print(soup)
 else :
     print(response.status_code)
-    
-#python 검색 시 처음으로 나오는 제목 F12 -> inspector로 크롤릴할 제목 클릭 -> copy as inspector
-
