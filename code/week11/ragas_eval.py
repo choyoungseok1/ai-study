@@ -27,7 +27,7 @@ rag_chain = make_rag_chain(vectorstore)
 
 
 # ── judge LLM + 임베딩 (RAGAS가 OpenAI 대신 Groq 쓰도록 명시) ──
-judge_llm = LangchainLLMWrapper(ChatGroq(model="llama-3.3-70b-versatile"))
+judge_llm = LangchainLLMWrapper(ChatGroq(model="openai/gpt-oss-120b"))
 judge_emb = LangchainEmbeddingsWrapper(
     HuggingFaceEmbeddings(model_name="paraphrase-multilingual-MiniLM-L12-v2")
 )
