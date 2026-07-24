@@ -1,12 +1,19 @@
 """
-agent.py — ReAct 멀티홉 Agentic RAG (Phase A, W2)
+agent.py — ReAct 멀티홉 Agentic RAG (Phase A, W3)
 
 retrieve.py의 2단계 검색을 도구로 등록하고,
 ReAct 루프(Thought→Action→Observation 반복)로 멀티홉 질문을 분해한다.
+
+[W3 변경점]
+  1. search()가 (본문 문자열, 제목 리스트) 둘 다 반환 → TOOL_MAP 경로 부활 (중복 경로 제거)
+  2. run_agent이 stopped("final" / "max_iters") 를 함께 반환
+  3. eval_* 3종이 recall만이 아니라 titles / search_log 까지 반환
+  4. 질문별 레코드를 JSONL로 append 저장 + 재실행 시 이어하기 (rate limit 대비)
 """
 
 import os
 import json
+import datetime
 
 from src.retrieve import Retriever
 
@@ -14,54 +21,47 @@ from src.retrieve import Retriever
 _retriever = Retriever()
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA = os.path.join(os.path.dirname(_HERE), "data")
+_EVAL_DIR = os.path.join(_DATA, "eval")
+
 
 # ─────────────────────────────────────────────
 # [A] 도구 실행부 — search 래퍼
 # ─────────────────────────────────────────────
-def search(query: str) -> str:
-    """query로 관련 문단을 찾아 LLM이 읽을 하나의 문자열로 반환."""
-    results = _retriever.retrieve_and_rerank(query, return_docs=True)
-    # results = [(제목, 본문), ...]  최대 5개
+def search(query: str):
+    """query로 관련 문단을 찾아 (LLM이 읽을 문자열, 제목 리스트) 를 반환.
 
-    # TODO(너): results를 하나의 문자열로 포맷
-    #   - 각 문단을 "[제목] 본문" 형태로
-    #   - 문단끼리 "\n\n" 로 구분
-    #   - (선택) 결과 비면 "No results found." 가드
-    if not results: return "No results found."
-    results = [f"[{t}] {d}" for t,d in results]
-    
-    return "\n\n".join(results)
+    ★ 변경: 제목 리스트를 같이 내보낸다.
+      이전에는 ReAct 루프가 titles를 얻으려고 _retriever를 직접 호출해서
+      '같은 일을 하는 경로'가 두 개였다. 이제 루프는 TOOL_MAP만 쓴다.
+    """
+    pairs = _retriever.retrieve_and_rerank(query, return_docs=True)
+    # pairs = [(제목, 본문), ...]  최대 5개
+
+    if not pairs:
+        return "No results found.", []
+
+    text = "\n\n".join(f"[{t}] {d}" for t, d in pairs)
+    titles = [t for t, _ in pairs]
+    return text, titles
 
 
 # ─────────────────────────────────────────────
-# [B] 도구 스키마 — Groq function calling 포맷  (다음 단계)
+# [B] 도구 스키마 — Groq function calling 포맷
 # ─────────────────────────────────────────────
-# TOOLS = [
-#     {
-#         "type": "function",
-#         "function": {
-#             "name": "search",
-#             "description": "...",          # LLM이 언제 쓸지 판단하는 근거
-#             "parameters": { ... },          # query: str 하나
-#         },
-#     }
-# ]
-#
-# TOOL_MAP = {"search": search}   # 이름→실제 함수 매핑
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "search",              # 실제 함수명과 일치해야 함
             "description": "Search the Wikipedia corpus for paragraphs relevant to the query. "
-               "Returns the top passages, each as '[title] text'. "
-               "Use this to look up facts about a specific entity, event, or topic.",
+                           "Returns the top passages, each as '[title] text'. "
+                           "Use this to look up facts about a specific entity, event, or topic.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query (keywords or a natural-language question)."
+                        "description": "The search query (keywords or a natural-language question).",
                     }
                 },
                 "required": ["query"],
@@ -70,9 +70,11 @@ TOOLS = [
     }
 ]
 
-TOOL_MAP = {"search": search}   # 이름 → 실제 함수. 나중에 루프에서 이걸로 실행
+TOOL_MAP = {"search": search}   # 이름 → 실제 함수
+
 from dotenv import load_dotenv
 from groq import Groq
+
 load_dotenv()
 _client = Groq()
 _MODEL = "openai/gpt-oss-120b"
@@ -87,15 +89,26 @@ Strategy:
 - When you have gathered enough information to answer, respond with the final answer directly and do NOT call the tool.
 
 Answer concisely — the answer is usually a short phrase, name, date, or number."""
+
+
 # ─────────────────────────────────────────────
-# [C] ReAct 루프  (다음 단계)
+# [C] ReAct 루프
 # ─────────────────────────────────────────────
-def run_agent(question: str, max_iters: int = 6,trace: bool = False) -> str:
+def run_agent(question: str, max_iters: int = 6, trace: bool = False, verbose: bool = False):
+    """멀티홉 질문에 답한다.
+
+    trace=False → 최종 답 문자열만 반환
+    trace=True  → {"answer", "search_log", "stopped"} 딕셔너리 반환
+
+    stopped: "final"     = LLM이 도구를 그만 부르고 답을 냄 (정상 종료)
+             "max_iters" = 반복 한도에 걸림 (정체 의심 케이스)
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
     search_log = []
+
     for step in range(max_iters):
         resp = _client.chat.completions.create(
             model=_MODEL,
@@ -107,70 +120,197 @@ def run_agent(question: str, max_iters: int = 6,trace: bool = False) -> str:
 
         # 도구 안 부름 = 최종 답 → 루프 종료
         if not msg.tool_calls:
-            print(f"[step {step}] FINAL")
+            if verbose:
+                print(f"[step {step}] FINAL")
             if trace:
-                return {"answer": msg.content, "search_log": search_log}
+                return {"answer": msg.content, "search_log": search_log, "stopped": "final"}
             return msg.content
 
         # 도구 부름 = 실행하고 결과 다시 넣기
         messages.append(msg)                    # assistant tool_call 먼저 (순서 중요)
         for tc in msg.tool_calls:
-            query = json.loads(tc.function.arguments)["query"]
-            pairs = _retriever.retrieve_and_rerank(query, return_docs=True)
-            titles = [t for t, d in pairs]
-            result = "\n\n".join(f"[{t}] {d}" for t, d in pairs)
-            print(f"[step {step}] search({query})")
-            search_log.append({"hop": step, "query": query, "titles": titles})
+            args = json.loads(tc.function.arguments)
+            fn = TOOL_MAP[tc.function.name]     # ★ TOOL_MAP 경로 사용 (직접 호출 제거)
+            result, titles = fn(**args)
+
+            if verbose:
+                print(f"[step {step}] search({args.get('query')})")
+
+            search_log.append({"hop": step, "query": args.get("query"), "titles": titles})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    # 반복 한도 도달
     if trace:
-            return {"answer": "[max iterations reached]", "search_log": search_log}
+        return {"answer": "[max iterations reached]", "search_log": search_log, "stopped": "max_iters"}
     return "[max iterations reached]"
+
+
+# ─────────────────────────────────────────────
+# [D] 평가 — 비교군 3종
+# ─────────────────────────────────────────────
 def recall_at_k(gold_titles, retrieved_titles):
     """gold 중 retrieved에 잡힌 비율."""
-    gold = set(gold_titles)            # ← 중복 제거 (아까 발견한 gold 중복 문제!)
+    gold = set(gold_titles)            # ← 중복 제거 (gold 중복 문제)
     retrieved = set(retrieved_titles)
-    
+
     if len(gold) == 0:
         return 0
-    return len(gold.intersection(retrieved))/len(gold)
+    return len(gold.intersection(retrieved)) / len(gold)
+
+
 def eval_pure_rag(question, gold, k=5):
-    titles, docs = _retriever.retrieve(question, k=k)   # bi-encoder top-k
-    return recall_at_k(gold, titles)
+    """bi-encoder top-k 만. 반환: {"titles", "recall"}"""
+    titles, docs = _retriever.retrieve(question, k=k)
+    return {"titles": titles, "recall": recall_at_k(gold, titles)}
+
+
 def eval_rerank_rag(question, gold, k_final=5):
-    titles = _retriever.retrieve_and_rerank(question, k_final=k_final)  # 제목만 (return_docs=False 기본)
-    return recall_at_k(gold, titles)
+    """20개 뽑아 5개로 재정렬. 반환: {"titles", "recall"}"""
+    titles = _retriever.retrieve_and_rerank(question, k_final=k_final)
+    return {"titles": titles, "recall": recall_at_k(gold, titles)}
+
+
 def eval_agentic(question, gold):
+    """ReAct 멀티홉. 반환: {"answer", "recall", "stopped", "search_log"}
+
+    ★ 변경: search_log를 통째로 내보낸다.
+      이전에는 여기서 recall 하나만 짜내고 나머지를 버렸다.
+      홉 수·고유 문서 수·정체 여부는 전부 search_log에서 나온다.
+    """
     result = run_agent(question, trace=True)
-    # TODO: result["search_log"]의 모든 hop에서 titles를 다 모아 합집합
-    #   - search_log = [{"hop":0, "query":..., "titles":[...]}, {"hop":1, ...}]
-    #   - 모든 titles를 하나의 리스트/set으로
-    
-    all_titles = set([t for log in result["search_log"] for t in log["titles"]])
-    return recall_at_k(gold, all_titles)
+
+    # 모든 홉의 titles 합집합 = 에이전트가 실제로 본 고유 문서
+    all_titles = {t for log in result["search_log"] for t in log["titles"]}
+
+    return {
+        "answer": result["answer"],
+        "recall": recall_at_k(gold, all_titles),
+        "stopped": result["stopped"],
+        "search_log": result["search_log"],
+    }
+
 
 # ─────────────────────────────────────────────
-# 손 테스트
+# [E] 결과 저장 — JSONL append + 이어하기
 # ─────────────────────────────────────────────
+def append_record(path, rec):
+    """레코드 한 줄 append. 중간에 죽어도 여기까지는 남는다."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:     # ← utf-8 필수 (Windows cp949 함정)
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
 
-if __name__ == "__main__":
-    qa = json.load(open(os.path.join(_DATA, "qa.json"), encoding="utf-8"))
-    subset = qa[:10]          # 먼저 10개만
 
-    pure_scores, rerank_scores, agentic_scores = [], [], []
+def load_done(path):
+    """이미 끝난 idx 집합 → 재실행 시 건너뛰기 (rate limit 대비)"""
+    if not os.path.exists(path):
+        return set()
+    done = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                done.add(json.loads(line)["idx"])
+    return done
+
+
+def load_records(path):
+    """저장된 레코드 전부 읽기 (분석용)"""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def run_eval(qa, out_path, limit=None):
+    """비교군 3종을 돌려 질문별 레코드를 JSONL로 저장.
+
+    - 이미 끝난 idx는 건너뜀 (이어하기)
+    - 질문 하나가 실패해도 error 필드에 남기고 다음으로 진행
+    - 파생값(홉 수, 고유 문서 수)은 저장하지 않는다 → search_log에서 언제든 재계산
+    """
+    subset = qa[:limit] if limit else qa
+    done = load_done(out_path)
+    if done:
+        print(f"이미 완료된 {len(done)}개 건너뜀")
+
     for i, item in enumerate(subset):
+        if i in done:
+            continue
+
         q = item["question"]
         gold = item["gold_titles"]
-        p = eval_pure_rag(q, gold)
-        r = eval_rerank_rag(q, gold)
-        a = eval_agentic(q, gold)
-        pure_scores.append(p)
-        rerank_scores.append(r)
-        agentic_scores.append(a)
-        print(f"[{i}] pure={p:.2f} rerank={r:.2f} agentic={a:.2f}  {q[:50]}")
 
-    n = len(subset)
-    print("=" * 50)
-    print(f"평균 recall (n={n})")
-    print(f"  순수 RAG   : {sum(pure_scores)/n:.3f}")
-    print(f"  재정렬 RAG : {sum(rerank_scores)/n:.3f}")
-    print(f"  Agentic    : {sum(agentic_scores)/n:.3f}")
+        rec = {
+            "idx": i,
+            "question": q,
+            "type": item.get("type"),
+            "gold_titles": gold,
+            "error": None,
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+
+        try:
+            rec["pure"] = eval_pure_rag(q, gold)
+            rec["rerank"] = eval_rerank_rag(q, gold)
+            rec["agentic"] = eval_agentic(q, gold)
+            print(f"[{i}] pure={rec['pure']['recall']:.2f} "
+                  f"rerank={rec['rerank']['recall']:.2f} "
+                  f"agentic={rec['agentic']['recall']:.2f} "
+                  f"hops={len(rec['agentic']['search_log'])}  {q[:45]}")
+        except Exception as e:
+            rec["error"] = f"{type(e).__name__}: {e}"
+            print(f"[{i}] ERROR {rec['error']}")
+
+        append_record(out_path, rec)
+
+    return load_records(out_path)
+
+
+# ─────────────────────────────────────────────
+# [F] 요약 — 기본 집계만 (타입별 분해는 W3-4에서)
+# ─────────────────────────────────────────────
+def summarize(records):
+    ok = [r for r in records if r["error"] is None]
+    n = len(ok)
+    if n == 0:
+        print("집계할 레코드 없음")
+        return
+
+    def avg(vals):
+        return sum(vals) / len(vals)
+
+    pure = avg([r["pure"]["recall"] for r in ok])
+    rerank = avg([r["rerank"]["recall"] for r in ok])
+    agentic = avg([r["agentic"]["recall"] for r in ok])
+
+    hops = [len(r["agentic"]["search_log"]) for r in ok]
+    uniq = [len({t for log in r["agentic"]["search_log"] for t in log["titles"]}) for r in ok]
+    stuck = sum(1 for r in ok if r["agentic"]["stopped"] == "max_iters")
+
+    print("=" * 55)
+    print(f"평균 recall (n={n}, 실패 {len(records) - n}건 제외)")
+    print(f"  순수 RAG   : {pure:.3f}   (컨텍스트 문서 5개 고정)")
+    print(f"  재정렬 RAG : {rerank:.3f}   (컨텍스트 문서 5개 고정)")
+    print(f"  Agentic    : {agentic:.3f}")
+    print("-" * 55)
+    print("Agentic 예산 실측")
+    print(f"  검색 횟수    평균 {avg(hops):.2f}  (최소 {min(hops)} / 최대 {max(hops)})")
+    print(f"  고유 문서 수 평균 {avg(uniq):.2f}  (최소 {min(uniq)} / 최대 {max(uniq)})")
+    print(f"  중복 제거 효과: 홉×5 = {avg(hops) * 5:.2f} → 실제 {avg(uniq):.2f}")
+    print(f"  max_iters 도달(정체 의심): {stuck}건")
+    print("=" * 55)
+
+    # TODO(너): bridge / comparison 타입별로 위 숫자를 분해할 것 (W3-4)
+    #   - r["type"] 으로 나눠서 각각 recall / 홉 수 / 고유 문서 수
+    #   - comparison에서 홉만 늘고 고유 문서가 안 늘면 = 정체 근거
+
+
+# ─────────────────────────────────────────────
+# 실행
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    qa = json.load(open(os.path.join(_DATA, "qa.json"), encoding="utf-8"))
+
+    OUT = os.path.join(_EVAL_DIR, "eval_n10.jsonl")   # 규모 늘릴 때 파일명 바꾸기
+    records = run_eval(qa, OUT, limit=10)
+    summarize(records)
