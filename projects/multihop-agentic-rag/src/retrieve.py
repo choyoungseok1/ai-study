@@ -13,7 +13,16 @@ import json
 
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
+from dotenv import load_dotenv        # ← 추가 (없으면)
+load_dotenv()                          # ← 추가
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+_DATA = os.path.join(_ROOT, "data")
+
+# ⚠️ 한글 경로(C:\Users\조영석\...)에서 chroma-hnswlib(C++ 확장)이
+#    hnsw 인덱스를 로드하지 못함. ASCII 경로를 .env 의 CHROMA_DIR 로 지정.
+_PERSIST_DEFAULT = os.getenv("CHROMA_DIR") or os.path.join(_DATA, "chroma")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)                 # multihop-agentic-rag/
 _DATA = os.path.join(_ROOT, "data")
@@ -26,14 +35,14 @@ COLLECTION = "en_minilm"
 class Retriever:
     def __init__(self, corpus_path=None, persist_dir=None):
         self.corpus_path = corpus_path or os.path.join(_DATA, "corpus.json")
-        self.persist_dir = persist_dir or os.path.join(_DATA, "chroma")
+        self.persist_dir = persist_dir or _PERSIST_DEFAULT
 
         self.embedder = SentenceTransformer(EMBED_MODEL)
         self.reranker = CrossEncoder(RERANK_MODEL)
 
         self.client = chromadb.PersistentClient(path=self.persist_dir)
         self.col = self.client.get_or_create_collection(COLLECTION)
-
+        
         self._build_if_empty()
 
     def _build_if_empty(self):

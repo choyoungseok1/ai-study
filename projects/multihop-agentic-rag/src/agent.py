@@ -264,7 +264,10 @@ def run_eval(qa, out_path, limit=None):
         append_record(out_path, rec)
 
     return load_records(out_path)
-
+def eval_pure_budget(question, gold, k):
+    """예산 통제 순수 RAG — k를 외부에서 지정"""
+    titles, docs = _retriever.retrieve(question, k=k)
+    return {"titles": titles, "recall": recall_at_k(gold, titles), "k": k}
 
 # ─────────────────────────────────────────────
 # [F] 요약 — 기본 집계만 (타입별 분해는 W3-4에서)
@@ -310,7 +313,35 @@ def summarize(records):
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     qa = json.load(open(os.path.join(_DATA, "qa.json"), encoding="utf-8"))
+    OUT = os.path.join(_EVAL_DIR, "eval_n10.jsonl")
 
-    OUT = os.path.join(_EVAL_DIR, "eval_n10.jsonl")   # 규모 늘릴 때 파일명 바꾸기
-    records = run_eval(qa, OUT, limit=10)
-    summarize(records)
+    records = load_records(OUT)
+    rows = []
+    for rec in records:
+        if rec["error"]:
+            continue
+        uniq = len({t for log in rec["agentic"]["search_log"] for t in log["titles"]})
+        pb = eval_pure_budget(rec["question"], rec["gold_titles"], k=uniq)
+        rows.append({
+            "idx": rec["idx"], "type": rec["type"], "k": uniq,
+            "pure": rec["pure"]["recall"],
+            "rerank": rec["rerank"]["recall"],
+            "pure_budget": pb["recall"],
+            "agentic": rec["agentic"]["recall"],
+        })
+        r = rows[-1]
+        print(f"[{r['idx']}] {r['type']:11} k={uniq:2}  "
+              f"pure={r['pure']:.2f} rerank={r['rerank']:.2f} "
+              f"pure_b={r['pure_budget']:.2f} agentic={r['agentic']:.2f}")
+
+    def avg(rs, key):
+        return sum(x[key] for x in rs) / len(rs) if rs else 0
+
+    print("\n" + "=" * 55)
+    for t in ("bridge", "comparison", None):
+        rs = rows if t is None else [x for x in rows if x["type"] == t]
+        if not rs:
+            continue
+        print(f"\n{t or '전체'} (n={len(rs)}, 평균 k={avg(rs,'k'):.1f})")
+        for key in ("pure", "rerank", "pure_budget", "agentic"):
+            print(f"  {key:12}: {avg(rs, key):.3f}")
