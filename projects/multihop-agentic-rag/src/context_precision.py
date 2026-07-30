@@ -65,8 +65,7 @@ def _call(prompt, max_retries=5):
 
 def is_relevant(question: str, document: str, gold_answer: str = None) -> bool:
     """이 document 가 question 의 정답에 관련 있는 근거인지 yes/no.
-
-    TODO(너) ①: 프롬프트 작성.
+    
       - question 과 document 를 주고, 이 문서가 질문에 답하는 데
         유용한 정보를 담고 있으면 yes, 무관하면 no
       - gold_answer 를 줄지 말지 결정 (아래 설계 질문 참고)
@@ -172,7 +171,11 @@ if __name__ == "__main__":
             print(f"\n[없음] {title}")
             continue
         doc = _corpus[title]
-        verdict = is_relevant(q2, doc)
+        doc = _corpus[title]
+        if title in rec["gold_titles"]:
+            verdict = True                      # gold 고정 (표와 동일 로직)
+        else:
+            verdict = is_relevant(q2, doc)
         gold_mark = "  ★gold" if title in rec["gold_titles"] else ""
         print(f"\n[{'O' if verdict else 'X'}] {title}{gold_mark}")
         print(f"    {doc[:200]}...")

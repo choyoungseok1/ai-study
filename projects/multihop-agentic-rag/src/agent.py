@@ -313,9 +313,10 @@ def summarize(records):
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     qa = json.load(open(os.path.join(_DATA, "qa.json"), encoding="utf-8"))
-    OUT = os.path.join(_EVAL_DIR, "eval_n10.jsonl")
+    OUT = os.path.join(_EVAL_DIR, "eval_n50.jsonl")     # ← n10 → n50
 
-    records = load_records(OUT)
+    records = run_eval(qa, OUT, limit=50)                # ← load_records → run_eval
+    
     rows = []
     for rec in records:
         if rec["error"]:
