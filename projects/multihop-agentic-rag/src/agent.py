@@ -109,11 +109,9 @@ TOOLS = [
 #    search가 retriever를 캡처하게 되면서 매핑을 run_agent 안에서 만든다.
 
 from dotenv import load_dotenv
-from groq import Groq
-
+from src.llm import default_provider
 load_dotenv()
-_client = Groq()
-_MODEL = "openai/gpt-oss-120b"
+
 
 
 SYSTEM_PROMPT = """You are a research assistant answering multi-hop questions using a search tool over a Wikipedia corpus.
@@ -131,7 +129,7 @@ Answer concisely — the answer is usually a short phrase, name, date, or number
 # [C] ReAct 루프
 # ─────────────────────────────────────────────
 def run_agent(question: str, max_iters: int = 6, trace: bool = False,
-              verbose: bool = False, retriever=None):
+              verbose: bool = False, retriever=None, provider=None):
     """멀티홉 질문에 답한다.
 
     trace=False → 최종 답 문자열만 반환
@@ -143,7 +141,9 @@ def run_agent(question: str, max_iters: int = 6, trace: bool = False,
     retriever: None이면 모듈 전역 _retriever 사용 (기존 호출부 호환).
                서빙은 자기 인스턴스를 넘겨 이중 로드를 피한다.
     """
-    retriever = retriever or _retriever
+    retriever = retriever or _default_retriever()
+    if provider is None:
+        provider = default_provider()      # ★ or 대신 is None
     tool_map = {"search": make_search(retriever)}
 
     messages = [
@@ -153,34 +153,25 @@ def run_agent(question: str, max_iters: int = 6, trace: bool = False,
     search_log = []
 
     for step in range(max_iters):
-        resp = _client.chat.completions.create(
-            model=_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
-        msg = resp.choices[0].message
+        result = provider.chat(messages, tools=TOOLS)
 
-        # 도구 안 부름 = 최종 답 → 루프 종료
-        if not msg.tool_calls:
+        if not result.tool_calls:
             if verbose:
                 print(f"[step {step}] FINAL")
             if trace:
-                return {"answer": msg.content, "search_log": search_log, "stopped": "final"}
-            return msg.content
+                return {"answer": result.text, "search_log": search_log, "stopped": "final"}
+            return result.text
 
-        # 도구 부름 = 실행하고 결과 다시 넣기
-        messages.append(msg)                    # assistant tool_call 먼저 (순서 중요)
-        for tc in msg.tool_calls:
-            args = json.loads(tc.function.arguments)
-            fn = tool_map[tc.function.name]     # ★ tool_map 경로 사용 (직접 호출 제거)
-            result, titles = fn(**args)
+        messages.append(result.raw)          # ★ 원본 그대로 (provider 고유 필드 보존)
+        for tc in result.tool_calls:
+            fn = tool_map[tc.name]
+            out, titles = fn(**tc.args)
 
             if verbose:
-                print(f"[step {step}] search({args.get('query')})")
+                print(f"[step {step}] search({tc.args.get('query')})")
 
-            search_log.append({"hop": step, "query": args.get("query"), "titles": titles})
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            search_log.append({"hop": step, "query": tc.args.get("query"), "titles": titles})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
 
     # 반복 한도 도달
     if trace:
