@@ -1,5 +1,5 @@
 """
-agent.py — ReAct 멀티홉 Agentic RAG (Phase A, W3)
+agent.py — ReAct 멀티홉 Agentic RAG (Phase A, W4)
 
 retrieve.py의 2단계 검색을 도구로 등록하고,
 ReAct 루프(Thought→Action→Observation 반복)로 멀티홉 질문을 분해한다.
@@ -9,6 +9,19 @@ ReAct 루프(Thought→Action→Observation 반복)로 멀티홉 질문을 분�
   2. run_agent이 stopped("final" / "max_iters") 를 함께 반환
   3. eval_* 3종이 recall만이 아니라 titles / search_log 까지 반환
   4. 질문별 레코드를 JSONL로 append 저장 + 재실행 시 이어하기 (rate limit 대비)
+
+[W4 변경점 — 2026-08-03]
+  5. ★ retriever 의존성 주입: run_agent(..., retriever=None)
+     - 이유: 서빙(app/main.py)이 agent를 import하면 Retriever 인스턴스가 2개가 된다
+       (cross-encoder 두 벌 + Chroma 커넥션 두 개, RAM 13GB에 부담)
+     - 세터(set_retriever) 방식을 기각한 이유: 전역을 갈아끼우면
+       "누가 무엇을 쓰는지"가 호출 시점의 전역 상태에 달리게 된다.
+       run_agent(q)만 봐서는 어떤 retriever를 쓰는지 알 수 없고,
+       동시 요청 중 교체되면 에러 없이 조용히 어긋난다.
+       주입은 호출부만 보면 답이 나온다.
+  6. search를 make_search(retriever) 팩토리로 변경
+     - tool 스키마에는 query 하나뿐이라 LLM이 retriever를 채워줄 수 없다
+       → 클로저로 미리 묶어 넣는다
 """
 
 import os
@@ -18,31 +31,53 @@ import datetime
 from src.retrieve import Retriever
 
 # 검색기는 무거우니(임베딩+리랭커+Chroma 로드) 모듈 로드 시 1회만 생성해 재사용
-_retriever = Retriever()
+# ⚠️ 이건 노트북·배치 평가용 기본값. 서빙은 자기 인스턴스를 주입한다.
+# 검색기는 무거우니(임베딩+리랭커+Chroma 로드) 재사용한다.
+# ★ 지연 생성: import 시점에 만들지 않는다.
+#   서빙(app/main.py)이 이 모듈을 import할 때 두 번째 인스턴스가 생기는 걸 막는다.
+#   주입은 '쓰는 쪽'만 고친 것이고, '만드는 쪽'도 같이 고쳐야 완성된다.
+_retriever = None
+
+
+def _default_retriever():
+    """배치 평가·노트북용 기본 인스턴스. 처음 필요할 때만 만든다."""
+    global _retriever
+    if _retriever is None:
+        _retriever = Retriever()
+    return _retriever
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DATA = os.path.join(os.path.dirname(_HERE), "data")
 _EVAL_DIR = os.path.join(_DATA, "eval")
 
 
 # ─────────────────────────────────────────────
-# [A] 도구 실행부 — search 래퍼
+# [A] 도구 실행부 — search 래퍼 (팩토리)
 # ─────────────────────────────────────────────
-def search(query: str):
-    """query로 관련 문단을 찾아 (LLM이 읽을 문자열, 제목 리스트) 를 반환.
+def make_search(retriever):
+    """retriever를 캡처한 search 도구를 만든다.
 
-    ★ 변경: 제목 리스트를 같이 내보낸다.
-      이전에는 ReAct 루프가 titles를 얻으려고 _retriever를 직접 호출해서
-      '같은 일을 하는 경로'가 두 개였다. 이제 루프는 TOOL_MAP만 쓴다.
+    ★ 왜 팩토리인가: tool 스키마에는 query 하나뿐이라
+      LLM이 retriever를 채워줄 수 없다. 클로저로 미리 묶어 넣는다.
     """
-    pairs = _retriever.retrieve_and_rerank(query, return_docs=True)
-    # pairs = [(제목, 본문), ...]  최대 5개
 
-    if not pairs:
-        return "No results found.", []
+    def search(query: str):
+        """query로 관련 문단을 찾아 (LLM이 읽을 문자열, 제목 리스트) 를 반환.
 
-    text = "\n\n".join(f"[{t}] {d}" for t, d in pairs)
-    titles = [t for t, _ in pairs]
-    return text, titles
+        ★ 제목 리스트를 같이 내보낸다.
+          이전에는 ReAct 루프가 titles를 얻으려고 retriever를 직접 호출해서
+          '같은 일을 하는 경로'가 두 개였다. 이제 루프는 tool_map만 쓴다.
+        """
+        pairs = retriever.retrieve_and_rerank(query, return_docs=True)
+        # pairs = [(제목, 본문), ...]  최대 5개
+
+        if not pairs:
+            return "No results found.", []
+
+        text = "\n\n".join(f"[{t}] {d}" for t, d in pairs)
+        titles = [t for t, _ in pairs]
+        return text, titles
+
+    return search
 
 
 # ─────────────────────────────────────────────
@@ -70,7 +105,8 @@ TOOLS = [
     }
 ]
 
-TOOL_MAP = {"search": search}   # 이름 → 실제 함수
+# ⚠️ 모듈 레벨 TOOL_MAP 제거됨 (W4).
+#    search가 retriever를 캡처하게 되면서 매핑을 run_agent 안에서 만든다.
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -94,7 +130,8 @@ Answer concisely — the answer is usually a short phrase, name, date, or number
 # ─────────────────────────────────────────────
 # [C] ReAct 루프
 # ─────────────────────────────────────────────
-def run_agent(question: str, max_iters: int = 6, trace: bool = False, verbose: bool = False):
+def run_agent(question: str, max_iters: int = 6, trace: bool = False,
+              verbose: bool = False, retriever=None):
     """멀티홉 질문에 답한다.
 
     trace=False → 최종 답 문자열만 반환
@@ -102,7 +139,13 @@ def run_agent(question: str, max_iters: int = 6, trace: bool = False, verbose: b
 
     stopped: "final"     = LLM이 도구를 그만 부르고 답을 냄 (정상 종료)
              "max_iters" = 반복 한도에 걸림 (정체 의심 케이스)
+
+    retriever: None이면 모듈 전역 _retriever 사용 (기존 호출부 호환).
+               서빙은 자기 인스턴스를 넘겨 이중 로드를 피한다.
     """
+    retriever = retriever or _retriever
+    tool_map = {"search": make_search(retriever)}
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
@@ -130,7 +173,7 @@ def run_agent(question: str, max_iters: int = 6, trace: bool = False, verbose: b
         messages.append(msg)                    # assistant tool_call 먼저 (순서 중요)
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments)
-            fn = TOOL_MAP[tc.function.name]     # ★ TOOL_MAP 경로 사용 (직접 호출 제거)
+            fn = tool_map[tc.function.name]     # ★ tool_map 경로 사용 (직접 호출 제거)
             result, titles = fn(**args)
 
             if verbose:
@@ -160,13 +203,13 @@ def recall_at_k(gold_titles, retrieved_titles):
 
 def eval_pure_rag(question, gold, k=5):
     """bi-encoder top-k 만. 반환: {"titles", "recall"}"""
-    titles, docs = _retriever.retrieve(question, k=k)
+    titles, docs = _default_retriever().retrieve(question, k=k)
     return {"titles": titles, "recall": recall_at_k(gold, titles)}
 
 
 def eval_rerank_rag(question, gold, k_final=5):
     """20개 뽑아 5개로 재정렬. 반환: {"titles", "recall"}"""
-    titles = _retriever.retrieve_and_rerank(question, k_final=k_final)
+    titles = _default_retriever().retrieve_and_rerank(question, k_final=k_final)
     return {"titles": titles, "recall": recall_at_k(gold, titles)}
 
 
@@ -188,6 +231,12 @@ def eval_agentic(question, gold):
         "stopped": result["stopped"],
         "search_log": result["search_log"],
     }
+
+
+def eval_pure_budget(question, gold, k):
+    """예산 통제 순수 RAG — k를 외부에서 지정"""
+    titles, docs = _default_retriever().retrieve(question, k=k)
+    return {"titles": titles, "recall": recall_at_k(gold, titles), "k": k}
 
 
 # ─────────────────────────────────────────────
@@ -264,10 +313,7 @@ def run_eval(qa, out_path, limit=None):
         append_record(out_path, rec)
 
     return load_records(out_path)
-def eval_pure_budget(question, gold, k):
-    """예산 통제 순수 RAG — k를 외부에서 지정"""
-    titles, docs = _retriever.retrieve(question, k=k)
-    return {"titles": titles, "recall": recall_at_k(gold, titles), "k": k}
+
 
 # ─────────────────────────────────────────────
 # [F] 요약 — 기본 집계만 (타입별 분해는 W3-4에서)
@@ -303,20 +349,16 @@ def summarize(records):
     print(f"  max_iters 도달(정체 의심): {stuck}건")
     print("=" * 55)
 
-    # TODO(너): bridge / comparison 타입별로 위 숫자를 분해할 것 (W3-4)
-    #   - r["type"] 으로 나눠서 각각 recall / 홉 수 / 고유 문서 수
-    #   - comparison에서 홉만 늘고 고유 문서가 안 늘면 = 정체 근거
-
 
 # ─────────────────────────────────────────────
 # 실행
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     qa = json.load(open(os.path.join(_DATA, "qa.json"), encoding="utf-8"))
-    OUT = os.path.join(_EVAL_DIR, "eval_n50.jsonl")     # ← n10 → n50
+    OUT = os.path.join(_EVAL_DIR, "eval_n50.jsonl")
 
-    records = run_eval(qa, OUT, limit=50)                # ← load_records → run_eval
-    
+    records = run_eval(qa, OUT, limit=50)
+
     rows = []
     for rec in records:
         if rec["error"]:

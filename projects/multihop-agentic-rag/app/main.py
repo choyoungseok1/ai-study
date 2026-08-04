@@ -39,7 +39,8 @@ async def lifespan(app: FastAPI):
 
     from src.retrieve import Retriever
     STATE["retriever"] = Retriever()
-
+    from src.agent import run_agent
+    STATE["run_agent"] = run_agent
     try:
         _ = STATE["retriever"].retrieve("warmup", k=1)
         print("[startup] retriever OK")
@@ -87,17 +88,20 @@ def health():
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     t0 = time.perf_counter()
+    answer, hops, log = None, 1, []      # ★ 분기 앞에서 한 번만 선언
+
     if req.mode == "pure":
         titles, _ = STATE["retriever"].retrieve(req.question, k=req.k)
-        answer, hops, log = None, 1, []
 
     elif req.mode == "rerank":
         titles = STATE["retriever"].retrieve_and_rerank(req.question, k_final=req.k)
-        answer, hops, log = None, 1, []
-    else:  # agentic
-        # TODO(8/1): LLMProvider 어댑터 붙인 뒤 연결
-        raise HTTPException(status_code=501, detail="agentic mode not wired yet")
 
+    else:  # agentic
+        result = STATE["run_agent"](req.question, trace=True, retriever=STATE["retriever"])
+        answer = result["answer"]
+        log = result["search_log"]
+        hops = len(log)
+        titles = list({t for h in log for t in h["titles"]})
     return AskResponse(
         question=req.question,
         mode=req.mode,
@@ -110,19 +114,12 @@ def ask(req: AskRequest):
 
 
 # ============================================================
-# 남은 것 (네가 채울 부분)
+# 남은 것
 # ============================================================
-# 1. src/retrieve.py 의 실제 함수 시그니처 확인 → 위 TODO 두 줄 수정
-#    (본문·제목 튜플로 반환하는지, k 인자명이 뭔지)
+# TODO(8/4): src/llm.py — LLMProvider 어댑터
+#   ChatResult(text, tool_calls, raw)  ← ★ raw 필수 (provider 고유 필드 보존)
+#   ToolCall(id, name, args:dict)
+#   OpenAICompatProvider(base_url, api_key, model)
+#   → agent.py 의 messages.append(msg) / json.loads(...arguments) 교체
 #
-# 2. src/llm.py — LLMProvider 인터페이스 (8/1)
-#      ChatResult(text, tool_calls, raw)   ← ★ raw 필수.
-#      ToolCall(id, name, args:dict)
-#      OpenAICompatProvider(base_url, api_key, model)
-#    되붙일 때 raw 를 쓴다. thought_signature 같은 provider 고유 필드 보존.
-#
-# 3. agent.py 의 messages.append(msg) / json.loads(...arguments) 를
-#    우리 타입으로 교체 → /ask 의 agentic 분기 연결
-#
-# 4. 비교 데모용 GET /compare?question=... (세 mode 나란히)
-#    — 이 프로젝트의 셀링포인트가 평가라서 값어치 있음. 여유 있으면.
+# TODO(여유): GET /compare — 3모드 나란히. search_log 대비가 이 프로젝트의 셀링포인트
