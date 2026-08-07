@@ -122,7 +122,8 @@ Strategy:
 - Do not put the entire multi-part question into one search. Search the specific sub-fact you need next.
 - When you have gathered enough information to answer, respond with the final answer directly and do NOT call the tool.
 
-Answer concisely — the answer is usually a short phrase, name, date, or number."""
+Output ONLY the answer — a short phrase, name, date, number, or "yes"/"no".
+Do not write a sentence. Do not explain."""
 
 
 # ─────────────────────────────────────────────
@@ -192,19 +193,30 @@ def recall_at_k(gold_titles, retrieved_titles):
     return len(gold.intersection(retrieved)) / len(gold)
 
 
-def eval_pure_rag(question, gold, k=5):
-    """bi-encoder top-k 만. 반환: {"titles", "recall"}"""
+from src.answer_eval import generate_answer, score_answer
+
+def eval_pure_rag(question, gold, k=5, gold_answer=None):
     titles, docs = _default_retriever().retrieve(question, k=k)
-    return {"titles": titles, "recall": recall_at_k(gold, titles)}
+    out = {"titles": titles, "recall": recall_at_k(gold, titles)}
+    if gold_answer is not None:
+        pred = generate_answer(question, list(zip(titles, docs)))
+        out["answer"] = pred
+        out.update(score_answer(pred, gold_answer))
+    return out
 
 
-def eval_rerank_rag(question, gold, k_final=5):
-    """20개 뽑아 5개로 재정렬. 반환: {"titles", "recall"}"""
-    titles = _default_retriever().retrieve_and_rerank(question, k_final=k_final)
-    return {"titles": titles, "recall": recall_at_k(gold, titles)}
+def eval_rerank_rag(question, gold, k_final=5, gold_answer=None):
+    pairs = _default_retriever().retrieve_and_rerank(
+        question, k_final=k_final, return_docs=True)
+    titles = [t for t, _ in pairs]
+    out = {"titles": titles, "recall": recall_at_k(gold, titles)}
+    if gold_answer is not None:
+        pred = generate_answer(question, pairs)
+        out["answer"] = pred
+        out.update(score_answer(pred, gold_answer))
+    return out
 
-
-def eval_agentic(question, gold):
+def eval_agentic(question, gold, gold_answer=None):
     """ReAct 멀티홉. 반환: {"answer", "recall", "stopped", "search_log"}
 
     ★ 변경: search_log를 통째로 내보낸다.
@@ -215,13 +227,15 @@ def eval_agentic(question, gold):
 
     # 모든 홉의 titles 합집합 = 에이전트가 실제로 본 고유 문서
     all_titles = {t for log in result["search_log"] for t in log["titles"]}
-
-    return {
+    out = {
         "answer": result["answer"],
         "recall": recall_at_k(gold, all_titles),
         "stopped": result["stopped"],
         "search_log": result["search_log"],
     }
+    if gold_answer is not None:
+        out.update(score_answer(result["answer"], gold_answer))
+    return out
 
 
 def eval_pure_budget(question, gold, k):
@@ -240,25 +254,39 @@ def append_record(path, rec):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         f.flush()
 
-
 def load_done(path):
-    """이미 끝난 idx 집합 → 재실행 시 건너뛰기 (rate limit 대비)"""
+    """이미 성공한 idx 집합 → 재실행 시 건너뛰기.
+
+    ⚠️ 2026-08-07 수정: 이전에는 error 레코드도 '완료'로 셌다.
+      rate limit 로 죽은 건이 영구히 스킵돼 이어하기가 실제로는
+      작동하지 않았다. 실패는 다시 시도한다.
+    """
     if not os.path.exists(path):
         return set()
     done = set()
     with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                done.add(json.loads(line)["idx"])
+                rec = json.loads(line)
+                if rec.get("error") is None:
+                    done.add(rec["idx"])
     return done
 
 
 def load_records(path):
-    """저장된 레코드 전부 읽기 (분석용)"""
+    """저장된 레코드 전부 읽기 (분석용).
+
+    ⚠️ 재시도로 같은 idx 가 여러 줄 있을 수 있다. 나중 것이 이긴다.
+    """
     if not os.path.exists(path):
         return []
+    by_idx = {}
     with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                by_idx[r["idx"]] = r
+    return [by_idx[k] for k in sorted(by_idx)]
 
 
 def run_eval(qa, out_path, limit=None):
@@ -267,6 +295,7 @@ def run_eval(qa, out_path, limit=None):
     - 이미 끝난 idx는 건너뜀 (이어하기)
     - 질문 하나가 실패해도 error 필드에 남기고 다음으로 진행
     - 파생값(홉 수, 고유 문서 수)은 저장하지 않는다 → search_log에서 언제든 재계산
+    - gold_answer가 있으면 정답률(em/f1)도 함께 측정
     """
     subset = qa[:limit] if limit else qa
     done = load_done(out_path)
@@ -285,18 +314,20 @@ def run_eval(qa, out_path, limit=None):
             "question": q,
             "type": item.get("type"),
             "gold_titles": gold,
+            "gold_answer": item.get("answer"),
             "error": None,
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         }
 
+        ga = rec["gold_answer"]
         try:
-            rec["pure"] = eval_pure_rag(q, gold)
-            rec["rerank"] = eval_rerank_rag(q, gold)
-            rec["agentic"] = eval_agentic(q, gold)
-            print(f"[{i}] pure={rec['pure']['recall']:.2f} "
-                  f"rerank={rec['rerank']['recall']:.2f} "
-                  f"agentic={rec['agentic']['recall']:.2f} "
-                  f"hops={len(rec['agentic']['search_log'])}  {q[:45]}")
+            rec["pure"] = eval_pure_rag(q, gold, gold_answer=ga)
+            rec["rerank"] = eval_rerank_rag(q, gold, gold_answer=ga)
+            rec["agentic"] = eval_agentic(q, gold, gold_answer=ga)
+            print(f"[{i}] pure={rec['pure']['recall']:.2f}/{rec['pure']['em']:.0f} "
+                  f"rerank={rec['rerank']['recall']:.2f}/{rec['rerank']['em']:.0f} "
+                  f"agentic={rec['agentic']['recall']:.2f}/{rec['agentic']['em']:.0f} "
+                  f"hops={len(rec['agentic']['search_log'])}  {q[:40]}")
         except Exception as e:
             rec["error"] = f"{type(e).__name__}: {e}"
             print(f"[{i}] ERROR {rec['error']}")
@@ -346,8 +377,7 @@ def summarize(records):
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     qa = json.load(open(os.path.join(_DATA, "qa.json"), encoding="utf-8"))
-    OUT = os.path.join(_EVAL_DIR, "eval_n50.jsonl")
-
+    OUT = os.path.join(_EVAL_DIR, "answer_v2_n50.jsonl")
     records = run_eval(qa, OUT, limit=50)
 
     rows = []
