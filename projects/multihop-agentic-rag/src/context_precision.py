@@ -20,15 +20,13 @@ context_precision.py — 검색 품질 지표 직접 구현 (W3-2)
 import os
 import json
 import time
-
+from src.llm import OpenAICompatProvider
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
 
 load_dotenv()
 
 # ⚠️ llama-3.3-70b 는 2026-06 단종. 현재 주력 모델로 교체.
 _MODEL = "openai/gpt-oss-120b"
-_llm = ChatGroq(model=_MODEL, temperature=0)   # judge 는 결정론적이 좋음 → temp=0
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -50,18 +48,42 @@ def titles_to_contexts(titles):
 # ─────────────────────────────────────────────
 # judge — 문서 1개가 질문/정답과 관련 있는지
 # ─────────────────────────────────────────────
+_judge = None
+
+
+def _get_judge():
+    """judge provider — 지연 생성 + 모델 고정.
+
+    ★ default_provider() 를 쓰지 않는다.
+      judge 는 측정 도구이고 에이전트는 측정 대상이다.
+      에이전트 provider 를 바꿨을 때 judge 까지 따라 바뀌면
+      지표 변화의 원인을 가를 수 없다.
+    ★ import 시점에 만들지 않는다 (llm.py 와 같은 이유).
+    """
+    global _judge
+    if _judge is None:
+        load_dotenv()
+        _judge = OpenAICompatProvider(
+            api_key=os.environ["GROQ_API_KEY"],
+            model=_MODEL,
+            base_url="https://api.groq.com/openai/v1",
+        )
+    return _judge
 def _call(prompt, max_retries=5):
     """rate limit 대비 재시도 래퍼. 실패하면 예외를 위로 던짐."""
     for attempt in range(max_retries):
         try:
-            return _llm.invoke(prompt).content.strip()
+            return _get_judge().chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0,
+            ).text.strip()
         except Exception as e:
             # Groq rate limit(429) 등 → 지수 백오프
             wait = 2 ** attempt
             print(f"    [retry {attempt+1}/{max_retries}] {type(e).__name__}, {wait}s 대기")
             time.sleep(wait)
     raise RuntimeError(f"judge 호출 {max_retries}회 실패")
-
+# 30~31줄 대체
 
 def is_relevant(question: str, document: str, gold_answer: str = None) -> bool:
     """이 document 가 question 의 정답에 관련 있는 근거인지 yes/no.

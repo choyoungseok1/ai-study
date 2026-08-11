@@ -238,10 +238,13 @@ def eval_agentic(question, gold, gold_answer=None):
     return out
 
 
-def eval_pure_budget(question, gold, k):
-    """예산 통제 순수 RAG — k를 외부에서 지정"""
-    titles, docs = _default_retriever().retrieve(question, k=k)
-    return {"titles": titles, "recall": recall_at_k(gold, titles), "k": k}
+def eval_pure_budget(question, gold, k, gold_answer=None):
+    """예산 통제 순수 RAG — k를 외부에서 지정.
+    gold_answer를 주면 생성까지 하고 EM/F1을 낸다 (기본은 검색만).
+    """
+    out = eval_pure_rag(question, gold, k=k, gold_answer=gold_answer)
+    out["k"] = k
+    return out
 
 
 # ─────────────────────────────────────────────
