@@ -9,8 +9,7 @@ from openai import OpenAI
 load_dotenv()
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"   # 끝 슬래시 유지
-MODEL    = "gemini-3.6-flash"   # ← AI Studio에서 확인 후 확정
-
+MODEL    = "gemini-3.5-flash-lite"
 client = OpenAI(api_key=os.getenv("GEMINI_API_KEY"), base_url=BASE_URL)
 
 # 네 프로젝트의 search 스키마와 동일하게

@@ -70,7 +70,12 @@ def _get_judge():
         )
     return _judge
 def _call(prompt, max_retries=5):
-    """rate limit 대비 재시도 래퍼. 실패하면 예외를 위로 던짐."""
+    """rate limit 대비 재시도 래퍼.
+
+    ⚠️ TPD(일일 한도)와 RPM(분당 한도)은 다르게 다뤄야 한다.
+      RPM은 기다리면 풀리지만 TPD는 하루가 지나야 한다.
+      TPD에 지수 백오프를 걸면 31초를 버리고 똑같이 실패한다.
+    """
     for attempt in range(max_retries):
         try:
             return _get_judge().chat(
@@ -78,7 +83,9 @@ def _call(prompt, max_retries=5):
                 temperature=0,
             ).text.strip()
         except Exception as e:
-            # Groq rate limit(429) 등 → 지수 백오프
+            msg = str(e)
+            if "per day" in msg or "TPD" in msg:
+                raise RuntimeError(f"일일 토큰 한도 소진 — 재시도 무의미: {e}") from e
             wait = 2 ** attempt
             print(f"    [retry {attempt+1}/{max_retries}] {type(e).__name__}, {wait}s 대기")
             time.sleep(wait)
