@@ -290,7 +290,26 @@ def load_records(path):
                 r = json.loads(line)
                 by_idx[r["idx"]] = r
     return [by_idx[k] for k in sorted(by_idx)]
+def load_scored(path):
+    """레코드를 읽되 저장된 em/f1 을 버리고 다시 채점한다.
 
+    ⚠️ 2026-08-17: em/f1 을 JSONL 에 저장한 것이 실수였다.
+      정규화를 고치면 저장값이 조용히 낡는다.
+      analysis 스크립트는 load_records 대신 이 함수를 쓴다.
+    ★ answer 원문을 저장해뒀기 때문에 LLM 호출 0회로 재채점된다.
+    """
+    from src.answer_eval import score_answer
+    recs = load_records(path)
+    for r in recs:
+        if r.get("error"):
+            continue
+        gold = r.get("gold_answer")
+        if gold is None:
+            continue
+        for v in r.values():
+            if isinstance(v, dict) and "answer" in v:
+                v.update(score_answer(v["answer"], gold))
+    return recs
 
 def run_eval(qa, out_path, limit=None):
     """비교군 3종을 돌려 질문별 레코드를 JSONL로 저장.

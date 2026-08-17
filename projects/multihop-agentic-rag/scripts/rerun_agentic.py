@@ -30,14 +30,15 @@ import time
 import datetime
 
 from src.agent import (
-    eval_agentic, load_done, load_records, append_record, _DATA,
+    eval_agentic, load_done, load_records, load_scored, append_record, _DATA,
 )
 
 RUN = 2
 SLEEP_SEC = 3
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DATA = os.path.join(os.path.dirname(_HERE), "data")
+# ⚠️ _DATA 는 src.agent 에서 import 한 것을 그대로 쓴다.
+#   여기서 다시 정의하면 두 정의가 갈릴 수 있다.
 _EVAL_DIR = os.path.join(_DATA, "eval")
 BASE = os.path.join(_EVAL_DIR, "answer_v2_n50.jsonl")          # run1 (원본)
 K50 = os.path.join(_EVAL_DIR, "pure_k50_bridge.jsonl")         # 대상 선정용
@@ -100,8 +101,9 @@ def main():
 
 def compare():
     """run1 vs run2 대응표본 비교."""
-    r1 = {r["idx"]: r["agentic"] for r in load_records(BASE) if not r.get("error")}
-    r2 = {r["idx"]: r["agentic"] for r in load_records(OUT) if not r.get("error")}
+    # ⚠️ load_scored: 저장된 em 을 버리고 현재 정규화로 재채점
+    r1 = {r["idx"]: r["agentic"] for r in load_scored(BASE) if not r.get("error")}
+    r2 = {r["idx"]: r["agentic"] for r in load_scored(OUT) if not r.get("error")}
     idxs = sorted(set(r1) & set(r2))
     if not idxs:
         print("\n비교할 공통 idx 없음")

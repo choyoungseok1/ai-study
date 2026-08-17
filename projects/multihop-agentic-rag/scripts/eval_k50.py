@@ -23,7 +23,7 @@ import time
 import datetime
 
 from src.agent import (
-    eval_pure_budget, load_done, load_records, append_record, _DATA,
+    eval_pure_budget, load_done, load_scored, append_record, _DATA,
 )
 
 K = 50
@@ -31,7 +31,7 @@ N_TARGET = 22           # TPD 제약. 늘리려면 남은 토큰을 먼저 확�
 SLEEP_SEC = 7           # ⚠️ TPM 회피용. TPD와 달리 TPM 은 기다리면 풀린다
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_DATA = os.path.join(os.path.dirname(_HERE), "data")
+# ⚠️ _DATA 는 src.agent 에서 import 한 것을 쓴다 (재정의 금지)
 _EVAL_DIR = os.path.join(_DATA, "eval")
 OUT = os.path.join(_EVAL_DIR, f"pure_k{K}_bridge.jsonl")
 
@@ -94,7 +94,7 @@ def main():
         if n < len(todo):
             time.sleep(SLEEP_SEC)
 
-    summarize(load_records(OUT))
+    summarize(load_scored(OUT))     # ⚠️ 저장된 em 대신 재채점값 사용
 
 
 def summarize(records):

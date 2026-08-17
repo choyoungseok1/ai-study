@@ -47,7 +47,13 @@ def normalize_answer(s):
     s = _SPACE_LIKE.sub(" ", s)
     s = unicodedata.normalize("NFKC", s)
     s = s.lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
+    # ⚠️ string.punctuation 은 ASCII 만 담는다.
+    #   2026-08-17 실측: 모델이 U+2011(NB-HYPHEN)을 출력하는데
+    #   NFKC 는 U+2010 으로만 접고 ASCII 하이픈으로 만들지 않는다.
+    #   → 코드포인트를 하나씩 추가하는 방식은 계속 뚫린다.
+    #     유니코드 일반 범주 P*(punctuation) / S*(symbol) 로 잡는다.
+    s = "".join(ch for ch in s
+                if not unicodedata.category(ch).startswith(("P", "S")))
     s = re.sub(r"\b(a|an|the)\b", " ", s)
     s = " ".join(s.split())
     return s

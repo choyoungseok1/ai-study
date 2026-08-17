@@ -16,7 +16,7 @@ import os
 import json
 from collections import Counter
 
-from src.agent import load_records
+from src.agent import load_scored
 
 # ─────────────────────────────────────────────
 # [경로] ⚠️ scripts/recall_curve.py 의 _EVAL_DIR 정의를 그대로 복사해 올 것.
@@ -31,17 +31,15 @@ LIMIT = 50
 # (가) 시도 통계 — 모든 줄, 중복 포함
 # ═════════════════════════════════════════════
 def attempt_stats(path):
-    """파일의 전 줄을 그대로 읽어 시도 횟수와 실패를 센다.
+    """파일의 전 줄을 읽어 시도 횟수와 실패 원인을 센다.
 
-    반환: (총 시도 수, 실패 수, 원인별 Counter)
+    반환: (총 시도 수, 원인별 Counter)
+      - "인프라 거부": TPD 소진. 에이전트가 실행조차 못 함
+      - "모델 결함":   tool call 스키마 위반 등
 
-    TODO
-      1. 줄 단위로 읽어 json.loads (⚠️ encoding="utf-8")
-      2. rec["error"] 가 None 이 아니면 실패
-      3. error 문자열은 f"{type(e).__name__}: {e}" 형태다.
-         → 원인별로 쪼개려면 무엇을 기준으로 자를지 정해라.
-         ⚠️ rate limit(내 TPD 제약)과 tool call 에러(모델 결함)는
-            성격이 완전히 달라서 한 숫자로 합치면 둘 다 못 쓴다.
+    ⚠️ 둘은 분모를 공유하면 안 된다. 성공률 계산은 호출부에서.
+    ⚠️ else 가 "모델 결함"이므로 새로운 예외 유형이 오면 조용히
+       그쪽으로 분류된다. 숫자가 이상하면 여기부터 의심할 것.
     """
 
     total = 0
@@ -54,7 +52,7 @@ def attempt_stats(path):
                 total += 1                    # 줄이 곧 시도
                 err = rec.get("error")
                 if err:
-                    causes["인프라 거부" if "RateLimit" in err else "모델 결함"] += 1          # ← 여기만 네가 정함
+                    causes["인프라 거부" if "RateLimit" in err else "모델 결함"] += 1
 
     return total, causes
 
@@ -149,7 +147,7 @@ def main():
     print(f"  TPD 소진 거부: {infra}회 (평가 운영 비용, 시스템 품질 아님)\n")
 
     # ── (나) 최종 ────────────────────────────
-    records = load_records(EVAL_PATH)
+    records = load_scored(EVAL_PATH)     # ⚠️ 저장된 em 대신 재채점값
     n, remaining_err, missing = final_stats(records)
     print(f"[최종 상태] n={n} / error {remaining_err}건 / 결측 idx {missing or '없음'}\n")
 
